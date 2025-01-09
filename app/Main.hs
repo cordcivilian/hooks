@@ -250,7 +250,7 @@ fetchLatestVersion logger config repo = do
     Dir.setCurrentDirectory $
         FP.normalise $ getReposDir config FP.</> getLocalRepoDir repo
     isSuccessful <- runCommands
-        [ ("git", ["fetch", "-q", "--atomic", getCloneURL repo, "main"])
+        [ ("git", ["fetch", "-q", "--atomic", "origin", "main"])
         , ("git", ["reset", "--hard", "origin/main"])
         , ("git", ["clean", "-dxqf"])
         ]
