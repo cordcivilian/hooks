@@ -199,7 +199,12 @@ mkConfig dir = Config
         (AbsDir $ unAbsDir dir FP.</> "hooked-repos")
         (URL "https://www.cordcivilian.com/updated")
     )
-    [ mkRepo (RelDir "cord") (URL "https://github.com/cordcivilian/cord.git")
+    [ mkRepo (RelDir "cord")
+             (URL "https://github.com/cordcivilian/cord.git")
+    , mkRepo (RelDir "anorby")
+             (URL "https://github.com/cordcivilian/anorby.git")
+    , mkRepo (RelDir "batsch")
+             (URL "https://github.com/cordcivilian/batsch.git")
     ]
 
 getReposDir :: Config -> FilePath
