@@ -203,8 +203,6 @@ mkConfig dir = Config
              (URL "https://github.com/cordcivilian/cord.git")
     , mkRepo (RelDir "anorby")
              (URL "https://github.com/cordcivilian/anorby.git")
-    , mkRepo (RelDir "batsch")
-             (URL "https://github.com/cordcivilian/batsch.git")
     ]
 
 getReposDir :: Config -> FilePath
