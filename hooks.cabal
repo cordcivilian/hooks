@@ -24,7 +24,7 @@ executable hooks
                     , text
                     , time
                     , unix
-                    , unix
+                    , unordered-containers
                     , wai
                     , wai-extra
                     , warp

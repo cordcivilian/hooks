@@ -1,5 +1,0 @@
---setup ":set -fobject-code -O2"
---reload=./app
--T Main.main
---test-message="Running hooks..."
---restart=./hooks.cabal
