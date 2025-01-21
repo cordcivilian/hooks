@@ -63,7 +63,7 @@ monolith configRef loggerRef =
 
     response <- case (method, path) of
       ("GET", "/") -> return $ rootRoute request
-      ("POST", "/events") -> 
+      ("POST", "/events") ->
         hookRoute configRef reqLogger request body
       ("GET", "/hooked/list") -> do
         config <- IORef.readIORef configRef
@@ -245,9 +245,9 @@ createProcessPipes logger execPath = do
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
-data Event = Event 
+data Event = Event
   { eventRef :: String
-  , eventRepoName :: String 
+  , eventRepoName :: String
   } deriving (Show)
 
 instance JSON.FromJSON Event where
@@ -322,9 +322,9 @@ buildRepo logger path = do
       logError logger "build" $ T.pack $ "Build failed:\n" ++ stderr
       return $ BuildFailure $ "Build failed:\n" ++ stderr
 
-handleBuildResult :: Logger -> Config -> Repo -> BuildResult 
+handleBuildResult :: Logger -> Config -> Repo -> BuildResult -> Bool
                   -> IO (SyncResult ())
-handleBuildResult logger config repo result =
+handleBuildResult logger config repo result shouldNotify =
   case result of
     BuildFailure err -> do
       logError logger "build" $ T.pack $ "Build failed: " ++ err
@@ -337,7 +337,19 @@ handleBuildResult logger config repo result =
           logError logger "build" $ T.pack $
             "Deploy directory setup failed: " ++ err
           return $ Left err
-        Right () -> deployAndNotify logger config repo execPath deployDir
+        Right () -> do
+          deployResult <- deployExecutable logger execPath deployDir repo config
+          case deployResult of
+            Left err -> do
+              logError logger "deploy" $ T.pack $
+                "Deployment failed: " ++ err
+              return $ Left err
+            Right paths -> do
+              logInfo logger "deploy" $ T.pack $
+                "Successfully deployed: " ++ show paths
+              if shouldNotify
+                then notify logger (notifyUrl config) repo
+                else return $ Right ()
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
@@ -392,7 +404,7 @@ deployExecutable logger srcPath destDir repo config = do
               return $ Right [destPath]
             paths -> do
               let repoRoot = getReposDir config FP.</> unPath (repoPath repo)
-              copyResult <- copyFilesAndDirs logger repoRoot exeDir 
+              copyResult <- copyFilesAndDirs logger repoRoot exeDir
                              (map unPath paths)
               case copyResult of
                 Left err -> return $ Left err
@@ -459,26 +471,26 @@ deployAndNotify logger config repo execPath deployDir = do
 runCommands :: Logger -> [(FilePath, [String])] -> IO Bool
 runCommands _ [] = return True
 runCommands logger ((cmd, args):rest) = do
-  let procLogger = withContext logger "command" 
+  let procLogger = withContext logger "command"
         (JSON.String $ T.pack $ cmd ++ " " ++ unwords args)
-      
+
   (_, Just stdout, Just stderr, ph) <- Process.createProcess (Process.proc cmd args)
     { Process.std_out = Process.CreatePipe
     , Process.std_err = Process.CreatePipe
     }
-  
+
   exitCode <- Process.waitForProcess ph
-  
+
   maybeSecret <- SysEnv.lookupEnv "HOOKER"
   Monad.when (Maybe.isNothing maybeSecret) $ do
     outContent <- IO.hGetContents stdout
     Monad.unless (null outContent) $
       logInfo procLogger "command_output" $ T.pack outContent
-  
+
   errContent <- IO.hGetContents stderr
   Monad.unless (null errContent) $
     logError procLogger "command_error" $ T.pack errContent
-    
+
   case exitCode of
     Exit.ExitSuccess -> runCommands logger rest
     Exit.ExitFailure _ -> return False
@@ -493,7 +505,7 @@ initializeAllRepos logger config = do
       case result of
         Left err ->
           logError l "init" $ T.pack $
-            "Failed to initialize " ++ 
+            "Failed to initialize " ++
             unPath (repoPath r) ++ ": " ++ err
         Right () -> return ()
 
@@ -513,16 +525,20 @@ initializeRepo logger config repo = do
           case cleanResult of
             Left e -> do
               logWarn logger "init" $ T.pack $
-                "Failed to clean build directory (continuing anyway): " ++ 
+                "Failed to clean build directory (continuing anyway): " ++
                 show (e :: Exception.SomeException)
-              return $ Right ()
-            Right isSuccessful -> 
+              buildResult <- buildRepo logger repoDir
+              handleBuildResult logger config repo buildResult False
+            Right isSuccessful ->
               if isSuccessful
-                then return $ Right ()
+                then do
+                  buildResult <- buildRepo logger repoDir
+                  handleBuildResult logger config repo buildResult False
                 else do
                   logWarn logger "init" $ T.pack $
                     "Failed to clean build directory (continuing anyway)"
-                  return $ Right ()
+                  buildResult <- buildRepo logger repoDir
+                  handleBuildResult logger config repo buildResult False
         Left err -> do
           logError logger "init" $ T.pack $
             "Failed to fetch latest version: " ++ err
@@ -595,23 +611,23 @@ syncRepo logger config repo = do
         Right () -> do
           cleanResult <- Exception.try $
             runCommands repoLogger [("cabal", ["clean"])]
-          case cleanResult of 
+          case cleanResult of
             Left e -> do
               logWarn repoLogger "sync" $ T.pack $
-                "Failed to clean build directory (continuing anyway): " ++ 
+                "Failed to clean build directory (continuing anyway): " ++
                 show (e :: Exception.SomeException)
               buildResult <- buildRepo repoLogger repoDir
-              handleBuildResult repoLogger config repo buildResult
+              handleBuildResult repoLogger config repo buildResult True
             Right isSuccessful ->
               if not isSuccessful
                 then do
                   logWarn repoLogger "sync" $ T.pack $
                     "Failed to clean build directory (continuing anyway)"
                   buildResult <- buildRepo repoLogger repoDir
-                  handleBuildResult repoLogger config repo buildResult
+                  handleBuildResult repoLogger config repo buildResult True
                 else do
                   buildResult <- buildRepo repoLogger repoDir
-                  handleBuildResult repoLogger config repo buildResult
+                  handleBuildResult repoLogger config repo buildResult True
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
@@ -629,7 +645,7 @@ notify :: Logger -> URL -> Repo -> IO (Either String ())
 notify logger notifyURL repo = do
   let notifyLogger = withContext logger "notify_url"
         (JSON.String $ T.pack $ unURL notifyURL)
-        
+
   maybeSecret <- SysEnv.lookupEnv "HOOKER"
   case maybeSecret of
     Nothing -> return $ Right ()
@@ -825,7 +841,7 @@ mkPath :: FilePath -> Path
 mkPath = Path . FP.normalise
 
 mkURL :: String -> URLType -> Either String URL
-mkURL url uType = 
+mkURL url uType =
   case URI.parseURI url of
     Just uri | isValidScheme uri -> Right $ URL url uType
     Just _ -> Left "Invalid URL scheme: must be http(s)"
@@ -836,7 +852,7 @@ mkURL url uType =
       "https:" -> True
       _ -> False
 
-mkRepo :: FilePath -> URL -> [Path] -> Repo 
+mkRepo :: FilePath -> URL -> [Path] -> Repo
 mkRepo path url extra = Repo
   { repoPath = Path path
   , repoUrl = url
@@ -846,7 +862,7 @@ mkRepo path url extra = Repo
 getReposDir :: Config -> FilePath
 getReposDir = unPath . reposPath
 
-getNotifyURL :: Config -> String 
+getNotifyURL :: Config -> String
 getNotifyURL = unURL . notifyUrl
 
 getLocalRepoDir :: Repo -> FilePath
@@ -878,15 +894,15 @@ newtype Path = Path
   { unPath :: FilePath
   } deriving (Eq, Show)
 
-data URL = URL 
+data URL = URL
   { unURL :: String
-  , urlType :: URLType 
+  , urlType :: URLType
   } deriving (Eq, Show)
 
 data URLType = Clone
              | Notify deriving (Eq, Show)
 
-data Config = Config 
+data Config = Config
   { reposPath :: Path
   , notifyUrl :: URL
   , repos :: [Repo]
@@ -905,7 +921,7 @@ mkConfig dir = Config
   { reposPath = Path $ dir FP.</> "hooked-repos"
   , notifyUrl = URL "https://www.cordcivilian.com/updated" Notify
   , repos =
-    [ mkRepo "cord" 
+    [ mkRepo "cord"
         (URL "https://github.com/cordcivilian/cord.git" Clone)
         []
     , mkRepo "anorby"
@@ -946,10 +962,10 @@ main = do
       let repoLogger = withContext logger "repo"
             (JSON.String $ T.pack $ unPath $ repoPath repo)
       buildResult <- buildRepo repoLogger $
-        FP.normalise $ getReposDir initialConfig FP.</> 
+        FP.normalise $ getReposDir initialConfig FP.</>
           unPath (repoPath repo)
       Monad.void $
-        handleBuildResult repoLogger initialConfig repo buildResult
+        handleBuildResult repoLogger initialConfig repo buildResult False
     ) repos'
 
   -- Start process monitor silently
