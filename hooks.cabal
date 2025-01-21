@@ -12,6 +12,7 @@ executable hooks
   hs-source-dirs:   app
   main-is:          Main.hs
   build-depends:    base ^>=4.20.0.0
+                    , Glob
                     , SHA
                     , aeson
                     , bytestring

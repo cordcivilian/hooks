@@ -11,6 +11,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BSLC
 import qualified Data.Digest.Pure.SHA as SHA
+import qualified Data.Either as Either
 import qualified Data.HashMap.Strict as HM
 import qualified Data.IORef as IORef
 import qualified Data.List as List
@@ -34,6 +35,7 @@ import qualified System.Directory as Dir
 import qualified System.Environment as SysEnv
 import qualified System.Exit as Exit
 import qualified System.FilePath as FP
+import qualified System.FilePath.Glob as Glob
 import qualified System.IO as IO
 import qualified System.IO.Error as IOError
 import qualified System.Posix.Env as PosixEnv
@@ -221,9 +223,46 @@ buildRepo logger repoPath = do
       logError logger "build" $ T.pack $ "Build failed:\n" ++ stderr
       return $ BuildFailure $ "Build failed:\n" ++ stderr
 
-deployExecutable :: Logger -> FilePath -> FilePath
-                 -> IO (Either String FilePath)
-deployExecutable logger srcPath destDir = do
+copyFilesAndDirs :: Logger -> FilePath -> FilePath -> [FilePath]
+                 -> IO (Either String [FilePath])
+copyFilesAndDirs logger srcDir destDir paths = do
+  let copyLogger = withContext logger "copy"
+        (JSON.String $ T.pack $ "Copying files to " ++ destDir)
+
+  Dir.createDirectoryIfMissing True destDir
+
+  results <- Monad.forM paths $ \path -> do
+    let srcPath = srcDir FP.</> path
+        destPath = destDir FP.</> FP.takeFileName path
+
+    exists <- Dir.doesPathExist srcPath
+    if not exists
+      then do
+        let err = "Source path does not exist: " ++ srcPath
+        logError copyLogger "copy" $ T.pack err
+        return $ Left err
+      else do
+        isDir <- Dir.doesDirectoryExist srcPath
+        if isDir
+          then do
+            contents <- Glob.glob $ srcPath FP.</> "**"
+            Monad.forM_ contents $ \content -> do
+              let relPath = FP.makeRelative srcPath content
+                  newDestPath = destPath FP.</> relPath
+              Dir.createDirectoryIfMissing True $ FP.takeDirectory newDestPath
+              Dir.copyFile content newDestPath
+            return $ Right destPath
+          else do
+            Dir.copyFile srcPath destPath
+            return $ Right destPath
+
+  case Either.partitionEithers results of
+    ([], paths') -> return $ Right paths'
+    (errs:_, _) -> return $ Left errs -- Match on non-empty list pattern
+
+deployExecutable :: Logger -> FilePath -> FilePath -> Repo -> Config
+                -> IO (Either String [FilePath])
+deployExecutable logger srcPath destDir repo config = do
   exists <- Dir.doesFileExist srcPath
   if exists
     then do
@@ -253,9 +292,21 @@ deployExecutable logger srcPath destDir = do
             Dir.setOwnerExecutable True $
             Dir.setOwnerReadable True $
             Dir.emptyPermissions
-          logInfo logger "deploy" $ T.pack $
-            "Deployed to " ++ destPath
-          return $ Right destPath
+
+          case copyPaths repo of
+            Nothing -> do
+              logInfo logger "deploy" $ T.pack $
+                "Deployed to " ++ destPath
+              return $ Right [destPath]
+            Just paths -> do
+              let repoRoot = getReposDir config FP.</> getLocalRepoDir repo
+              copyResult <- copyFilesAndDirs logger repoRoot exeDir paths
+              case copyResult of
+                Left err -> return $ Left err
+                Right copiedPaths -> do
+                  logInfo logger "deploy" $ T.pack $
+                    "Deployed executable and files to " ++ exeDir
+                  return $ Right (destPath : copiedPaths)
     else do
       logError logger "deploy" "Source executable not found"
       return $ Left "Source executable not found"
@@ -422,7 +473,7 @@ hookRoute statesRef logger request body = do
 
         mapM_ (syncRepo eventLogger config) hookedRepo
 
-      _ -> return () -- Silent for non-main branch events
+      _ -> return ()
 
     (Left err, _) ->
       logError contextLogger "webhook" $
@@ -532,7 +583,10 @@ data Deploy = Deploy
   { reposDir :: ReposDir , notifyURL :: NotifyURL } deriving (Eq, Show)
 
 data Repo = Repo
-  { localRepoDir :: LocalRepoDir , cloneURL :: CloneURL } deriving (Eq, Show)
+  { localRepoDir :: LocalRepoDir
+  , cloneURL :: CloneURL
+  , copyPaths :: Maybe [FilePath]
+  } deriving (Eq, Show)
 
 data Config = Config
   { unDeploy :: Deploy
@@ -544,8 +598,9 @@ data Config = Config
 mkDeploy :: AbsDir -> URL -> Deploy
 mkDeploy dir url = Deploy (ReposDir dir) (NotifyURL url)
 
-mkRepo :: RelDir -> URL -> Repo
-mkRepo dir url = Repo (LocalRepoDir dir) (CloneURL url)
+mkRepo :: RelDir -> URL -> [FilePath] -> Repo
+mkRepo dir url paths = Repo (LocalRepoDir dir) (CloneURL url) $
+  if null paths then Nothing else Just paths
 
 getReposDir :: Config -> FilePath
 getReposDir config = unAbsDir $ unReposDir $ reposDir $ unDeploy $ config
@@ -729,21 +784,22 @@ ensureDeployDir logger deployDir = do
 deployAndNotify :: Logger -> Config -> Repo -> FilePath -> FilePath
                 -> IO (SyncResult ())
 deployAndNotify logger config repo execPath deployDir = do
-  deployResult <- deployExecutable logger execPath deployDir
+  deployResult <- deployExecutable logger execPath deployDir repo config
   case deployResult of
     Left err -> do
-      logError logger "deploy" $ T.pack $
-        "Deployment failed: " ++ err
+      logError logger "deploy" $ T.pack $ "Deployment failed: " ++ err
       return $ Left err
-    Right _ -> notify logger (getNotifyURL config) repo
+    Right paths -> do
+      logInfo logger "deploy" $ T.pack $
+        "Successfully deployed: " ++ show paths
+      notify logger (getNotifyURL config) repo
 
 handleBuildResult :: Logger -> Config -> Repo -> BuildResult
                   -> IO (SyncResult ())
 handleBuildResult logger config repo result =
   case result of
     BuildFailure err -> do
-      logError logger "build" $ T.pack $
-        "Build failed: " ++ err
+      logError logger "build" $ T.pack $ "Build failed: " ++ err
       return $ Left err
 
     BuildSuccess execPath -> do
@@ -793,18 +849,18 @@ mkConfig dir = Config
   )
   [ mkRepo (RelDir "cord")
            (URL "https://github.com/cordcivilian/cord.git")
-  -- , mkRepo (RelDir "anorby")
-  --          (URL "https://github.com/cordcivilian/anorby.git")
+           []
+  , mkRepo (RelDir "anorby")
+           (URL "https://github.com/cordcivilian/anorby.git")
+           ["data"]
   ]
 
 main :: IO ()
 main = do
-  -- Initialize main logger
   mainLogger <- mkStdoutLogger
   loggerRef <- IORef.newIORef mainLogger
   let logger = mainLogger
 
-  -- Read configuration
   maybePort <- SysEnv.lookupEnv "PORT"
   let autoPort = 8888
       port = maybe autoPort read maybePort
@@ -812,15 +868,12 @@ main = do
   logInfo logger "startup" $ T.pack $
     "Server starting on port " ++ show (port :: Int)
 
-  -- Initialize config
   home <- Dir.getHomeDirectory
   let initialConfig = mkConfig $ AbsDir home
   config <- IORef.newIORef initialConfig
 
-  -- Initialize repositories silently
   initializeAllRepos logger initialConfig
 
-  -- Initialize process management
   procRef <- IORef.newIORef [] :: IO (IORef.IORef ProcessMap)
   let binDir = getReposDir initialConfig FP.</> "hooked-bin"
   Dir.createDirectoryIfMissing True binDir
@@ -850,7 +903,6 @@ main = do
       ) repoExecs
     Concurrent.threadDelay 5000000
 
-  -- Start server (only log in development)
   maybeSecret <- SysEnv.lookupEnv "HOOKER"
   Monad.when (Maybe.isNothing maybeSecret) $
     logInfo logger "startup" "Development server started"
