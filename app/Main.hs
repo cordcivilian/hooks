@@ -228,8 +228,12 @@ deployExecutable logger srcPath destDir = do
   if exists
     then do
       let fileName = FP.takeFileName srcPath
-          destPath = destDir FP.</> fileName
+          exeDir = destDir FP.</> fileName
+          destPath = exeDir FP.</> fileName
           backupPath = destPath ++ ".bak"
+
+      Dir.createDirectoryIfMissing True exeDir
+
       destExists <- Dir.doesFileExist destPath
       Monad.when destExists $
         Dir.copyFile destPath backupPath
@@ -313,7 +317,8 @@ startNewProcess logger procRef execPath = do
             }
       IORef.modifyIORef procRef ((execPath, newProc):)
     Nothing -> do
-      let envFile = FP.takeDirectory execPath FP.</> "process-env.yaml"
+      let binDir = FP.takeDirectory $ FP.takeDirectory execPath
+          envFile = binDir FP.</> "process-env.yaml"
       envExists <- Dir.doesFileExist envFile
       mbEnv <- if not envExists
         then return Nothing
@@ -834,7 +839,9 @@ main = do
 
   -- Start process monitor silently
   _ <- Concurrent.forkIO $ Monad.forever $ do
-    let repoExecs = map (binDir FP.</>) $ map getLocalRepoDir repos
+    let repoExecs = map (\repo ->
+          let exeName = FP.takeFileName $ getLocalRepoDir repo
+          in binDir FP.</> exeName FP.</> exeName) repos
     mapM_
       (\execPath -> do
         exists <- Dir.doesFileExist execPath
