@@ -2,6 +2,7 @@
 
 module Main where
 
+import qualified System.IO as IO
 import qualified Control.Concurrent as Concurrent
 import qualified Control.Exception as Exception
 import qualified Control.Monad as Monad
@@ -43,7 +44,33 @@ data ProcessInfo = ProcessInfo
   { procHandle :: Process.ProcessHandle
   , procExecPath :: FilePath
   , procStartTime :: Clock.UTCTime
+  , procLogFile :: FilePath  -- New field for log file
   }
+
+getProcessLogPath :: FilePath -> IO FilePath
+getProcessLogPath execPath = do
+  let logDir = FP.takeDirectory execPath FP.</> "logs"
+  Dir.createDirectoryIfMissing True logDir
+  let logFile = logDir FP.</> FP.takeBaseName execPath ++ ".log"
+  return logFile
+
+findExistingProcess :: FilePath -> IO (Maybe Int)
+findExistingProcess execPath = do
+  let cmd = Process.proc "pgrep" ["-f", execPath]
+  result <- Exception.try $ Process.readCreateProcessWithExitCode cmd ""
+  case result of
+    Left e -> do
+      TIO.putStrLn $ T.pack $ "Error checking process: " ++
+        show (e :: Exception.SomeException)
+      return Nothing
+    Right (exitCode, stdout, _) -> case exitCode of
+      Exit.ExitSuccess ->
+        case lines stdout of
+        [] -> return Nothing
+        (firstLine:_) -> case reads firstLine of
+          [(pid, "")] -> return $ Just pid
+          _ -> return Nothing
+      Exit.ExitFailure _ -> return Nothing
 
 data ProcessEnv = ProcessEnv
   { processName :: String
@@ -109,61 +136,113 @@ deployExecutable logger srcPath destDir = do
 
 ensureProcessRunning :: Logger -> IORef.IORef ProcessMap -> FilePath -> IO ()
 ensureProcessRunning logger procRef execPath = do
-  procs <- IORef.readIORef procRef
-  case lookup execPath procs of
-    Just info -> do
-      mbExit <- Process.getProcessExitCode $ procHandle info
-      case mbExit of
-        Nothing -> return ()
-        Just _ -> do
-          logger $ T.pack $ "Process for " ++ execPath ++ " died, restarting"
-          startNewProcess logger procRef execPath
-    Nothing -> startNewProcess logger procRef execPath
+  existingPID <- findExistingProcess execPath
+  case existingPID of
+    Just pid -> do
+      -- Process already running, add to our map if not tracked
+      procs <- IORef.readIORef procRef
+      case lookup execPath procs of
+        Just _ -> return ()  -- Already tracking this process
+        Nothing -> do
+          currentTime <- Clock.getCurrentTime
+          (_, _, _, handle) <- Process.createProcess (Process.proc "true" [])
+            { Process.std_in = Process.NoStream
+            , Process.std_out = Process.NoStream
+            , Process.std_err = Process.NoStream
+            }
+          logPath <- getProcessLogPath execPath
+          let newProc = ProcessInfo
+                { procHandle = handle
+                , procExecPath = execPath
+                , procStartTime = currentTime
+                , procLogFile = logPath
+                }
+          IORef.modifyIORef procRef ((execPath, newProc):)
+          logger $ T.pack $ "Found existing process for " ++ execPath ++
+            " (PID: " ++ show pid ++ ", logs at " ++ logPath ++ ")"
+    Nothing -> do
+      procs <- IORef.readIORef procRef
+      case lookup execPath procs of
+        Just info -> do
+          mbExit <- Process.getProcessExitCode $ procHandle info
+          case mbExit of
+            Nothing -> return ()  -- Process still running
+            Just _ -> do
+              logger $ T.pack $ "Process for " ++ execPath ++ " died, restarting"
+              startNewProcess logger procRef execPath
+        Nothing -> startNewProcess logger procRef execPath
 
 startNewProcess :: Logger -> IORef.IORef ProcessMap -> FilePath -> IO ()
 startNewProcess logger procRef execPath = do
-  let envFile = FP.takeDirectory execPath FP.</> "process-env.yaml"
-  envExists <- Dir.doesFileExist envFile
-  mbEnv <- if not envExists
-    then return Nothing
-    else do
-      result <- YAML.decodeFileEither envFile
-        :: IO (Either YAML.ParseException [ProcessEnv])
-      case result of
-        Right envs -> do
-          let matchingEnv = List.find
-                (\e -> processName e == FP.takeFileName execPath)
-                envs
-          case matchingEnv of
-            Just env -> do
-              logger $ T.pack $ "Loading environment for " ++ execPath
-              return $ Just $ envVars env
-            Nothing -> return Nothing
-        Left err -> do
-          logger $ T.pack $ "Error parsing env file: " ++ show err
-          return Nothing
-
-  currentEnv <- PosixEnv.getEnvironment
-  let processEnv = maybe currentEnv (++ currentEnv) mbEnv
-
-  (_, _, _, pHandle) <- Process.createProcess $ (Process.proc execPath [])
-    { Process.std_in = Process.NoStream
-    , Process.std_out = Process.NoStream
-    , Process.std_err = Process.NoStream
-    , Process.env = Just processEnv
-    }
-
-  currentTime <- Clock.getCurrentTime
-  let newProc = ProcessInfo
-        { procHandle = pHandle
-        , procExecPath = execPath
-        , procStartTime = currentTime
+  -- Double check no process exists right before starting
+  existingPID <- findExistingProcess execPath
+  case existingPID of
+    Just pid -> do
+      logger $ T.pack $ "Process already started by another instance " ++
+        "(PID: " ++ show pid ++ ")"
+      currentTime <- Clock.getCurrentTime
+      (_, _, _, handle) <- Process.createProcess (Process.proc "true" [])
+        { Process.std_in = Process.NoStream
+        , Process.std_out = Process.NoStream
+        , Process.std_err = Process.NoStream
         }
-  procs <- IORef.readIORef procRef
-  let updatedProcs = (execPath, newProc) :
-                     filter ((execPath /=) . fst) procs
-  IORef.writeIORef procRef updatedProcs
-  logger $ T.pack $ "Started new process for " ++ execPath
+      logPath <- getProcessLogPath execPath
+      let newProc = ProcessInfo
+            { procHandle = handle
+            , procExecPath = execPath
+            , procStartTime = currentTime
+            , procLogFile = logPath
+            }
+      IORef.modifyIORef procRef ((execPath, newProc):)
+    Nothing -> do
+      let envFile = FP.takeDirectory execPath FP.</> "process-env.yaml"
+      envExists <- Dir.doesFileExist envFile
+      mbEnv <- if not envExists
+        then return Nothing
+        else do
+          result <- YAML.decodeFileEither envFile
+            :: IO (Either YAML.ParseException [ProcessEnv])
+          case result of
+            Right envs -> do
+              let matchingEnv = List.find
+                    (\e -> processName e == FP.takeFileName execPath)
+                    envs
+              case matchingEnv of
+                Just env -> do
+                  logger $ T.pack $ "Loading environment for " ++ execPath
+                  return $ Just $ envVars env
+                Nothing -> return Nothing
+            Left err -> do
+              logger $ T.pack $ "Error parsing env file: " ++ show err
+              return Nothing
+
+      currentEnv <- PosixEnv.getEnvironment
+      let processEnv = maybe currentEnv (++ currentEnv) mbEnv
+
+      logPath <- getProcessLogPath execPath
+      logHandle <- IO.openFile logPath IO.AppendMode
+      IO.hSetBuffering logHandle IO.LineBuffering
+
+      (_, _, _, pHandle) <- Process.createProcess $ (Process.proc execPath [])
+        { Process.std_in = Process.NoStream
+        , Process.std_out = Process.UseHandle logHandle
+        , Process.std_err = Process.UseHandle logHandle
+        , Process.env = Just processEnv
+        }
+
+      currentTime <- Clock.getCurrentTime
+      let newProc = ProcessInfo
+            { procHandle = pHandle
+            , procExecPath = execPath
+            , procStartTime = currentTime
+            , procLogFile = logPath
+            }
+      procs <- IORef.readIORef procRef
+      let updatedProcs = (execPath, newProc) :
+                        filter ((execPath /=) . fst) procs
+      IORef.writeIORef procRef updatedProcs
+      logger $ T.pack $ "Started new process for " ++ execPath ++
+        " (logs at " ++ logPath ++ ")"
 
 hooks :: IORef.IORef Config -> Logger -> Wai.Application
 hooks statesRef logger request respond = do
@@ -376,9 +455,9 @@ initializeAllRepos logger config = do
   mapM_ (\repo -> do
     result <- initializeRepo logger config repo
     case result of
-      Left err -> logger $ T.pack $ 
+      Left err -> logger $ T.pack $
         "Failed to initialize " ++ getLocalRepoDir repo ++ ": " ++ err
-      Right () -> logger $ T.pack $ 
+      Right () -> logger $ T.pack $
         "Successfully initialized " ++ getLocalRepoDir repo
     ) repos
 
@@ -386,12 +465,21 @@ initializeRepo :: Logger -> Config -> Repo -> IO (SyncResult ())
 initializeRepo logger config repo = do
   let baseDir = getReposDir config
       repoDir = FP.normalise $ baseDir FP.</> getLocalRepoDir repo
-  
+
   exists <- Dir.doesDirectoryExist repoDir
-  if exists 
+  if exists
     then do
       logger $ T.pack $ "Fetching latest for " ++ getLocalRepoDir repo
-      fetchLatestVersion logger config repo
+      fetchResult <- fetchLatestVersion logger repoDir
+      case fetchResult of
+        Right () -> do
+          notifyResult <- notify logger (getNotifyURL config) repo
+          case notifyResult of
+            Left err ->
+              logger $ T.pack $ "Warning: Notification failed: " ++ err
+            Right () -> return ()
+          return $ Right ()
+        Left err -> return $ Left err
     else do
       logger $ T.pack $ "Cloning " ++ getCloneURL repo
       Dir.createDirectoryIfMissing True baseDir
@@ -406,10 +494,9 @@ initializeRepo logger config repo = do
           logger $ T.pack err
           return $ Left err
 
-fetchLatestVersion :: Logger -> Config -> Repo -> IO (Either String ())
-fetchLatestVersion logger config repo = do
+fetchLatestVersion :: Logger -> FilePath -> IO (Either String ())
+fetchLatestVersion logger repoPath = do
   logger $ T.pack "local repo found, fetching latest version"
-  let repoPath = FP.normalise $ getReposDir config FP.</> getLocalRepoDir repo
   dirResult <- Exception.try (Dir.setCurrentDirectory repoPath)
   case dirResult of
     Left e -> return $ Left $
@@ -421,55 +508,54 @@ fetchLatestVersion logger config repo = do
         , ("git", ["clean", "-dxqf"])
         ]
       case isSuccessful of
-        True -> do
-          notifyResult <- notify logger (getNotifyURL config) repo
-          case notifyResult of
-            Right () -> return $ Right ()
-            Left err -> return $ Left $ "Notification failed: " ++ err
+        True -> return $ Right ()
         False -> return $ Left "Git commands failed"
 
 notify :: Logger -> String -> Repo -> IO (Either String ())
 notify logger url repo = do
-  currentTime <- Clock.getCurrentTime
   maybeSecret <- SysEnv.lookupEnv "HOOKER"
-  let secret = maybe "" id maybeSecret
-
-  initRequestResult <- Exception.try (HTTP.parseRequest url)
-  case initRequestResult of
-    Left e -> return $ Left $
-      "Failed to parse URL: " ++ show (e :: Exception.SomeException)
-    Right initRequest -> do
-      let hourlyVersion = ['a'..'z'] !!
-            (read $ DateTimeFormat.formatTime
-              DateTimeFormat.defaultTimeLocale "%H" currentTime)
-          dailyVersion = DateTimeFormat.formatTime
-            DateTimeFormat.defaultTimeLocale "%Y-%m-%d" currentTime
-          body = JSON.encode $
-            Notification (getHtmlURL repo) (dailyVersion ++ [hourlyVersion])
-          signature = [BSC.pack "sha256=", sign body secret]
-          request = HTTP.setRequestMethod "POST" $
-            HTTP.setRequestSecure True $
-            HTTP.setRequestHeaders
-              [ (Headers.hContentType, BSC.pack "application/json")
-              , (Headers.hContentLength, BSC.pack $ show $ BSLC.length body)
-              , ("Hooker-Signature-256", BSC.concat signature)
-              ] $
-            HTTP.setRequestBodyLBS body $
-            initRequest
-      responseResult <- Exception.try (HTTP.httpLBS request)
-      case responseResult of
-        Left e -> do
-          let err = "HTTP request failed: " ++ show (e :: HTTP.HttpException)
-          logger $ T.pack err
-          return $ Left err
-        Right response -> case HTTP.getResponseStatusCode response of
-          200 -> do
-            logger $ T.pack "hook event notified"
-            return $ Right ()
-          code -> do
-            let err = "Invalid response code: " ++ show code
-            logger $ T.pack err
-            return $ Left err
+  case maybeSecret of
+    Nothing -> do
+      logger $ T.pack "Not in production, skipping notification"
+      return $ Right ()
+    Just secret -> do
+      currentTime <- Clock.getCurrentTime
+      initRequestResult <- Exception.try (HTTP.parseRequest url)
+      case initRequestResult of
+        Left e -> return $ Left $
+          "Failed to parse URL: " ++ show (e :: Exception.SomeException)
+        Right initRequest -> do
+          let hourlyVersion = ['a'..'z'] !!
+                (read $ DateTimeFormat.formatTime
+                  DateTimeFormat.defaultTimeLocale "%H" currentTime)
+              dailyVersion = DateTimeFormat.formatTime
+                DateTimeFormat.defaultTimeLocale "%Y-%m-%d" currentTime
+              body = JSON.encode $
+                Notification (getHtmlURL repo) (dailyVersion ++ [hourlyVersion])
+              signature = [BSC.pack "sha256=", sign body secret]
+              request = HTTP.setRequestMethod "POST" $
+                HTTP.setRequestSecure True $
+                HTTP.setRequestHeaders
+                  [ (Headers.hContentType, BSC.pack "application/json")
+                  , (Headers.hContentLength, BSC.pack $ show $ BSLC.length body)
+                  , ("Hooker-Signature-256", BSC.concat signature)
+                  ] $
+                HTTP.setRequestBodyLBS body $
+                initRequest
+          responseResult <- Exception.try (HTTP.httpLBS request)
+          case responseResult of
+            Left e -> do
+              let err = "HTTP request failed: " ++ show (e :: HTTP.HttpException)
+              logger $ T.pack err
+              return $ Left err
+            Right response -> case HTTP.getResponseStatusCode response of
+              200 -> do
+                logger $ T.pack "hook event notified"
+                return $ Right ()
+              code -> do
+                let err = "Invalid response code: " ++ show code
+                logger $ T.pack err
+                return $ Left err
 
 type SyncResult = Either String
 
@@ -507,8 +593,8 @@ deployAndNotify logger config repo execPath deployDir = do
       notifyResult <- notify logger (getNotifyURL config) repo
       case notifyResult of
         Left err -> do
-          logger $ T.pack $ "Notification failed after deployment: " ++ err
-          return $ Left err
+          logger $ T.pack $ "Warning: Notification failed after deployment: " ++ err
+          return $ Right () -- Continue despite notification failure
         Right () -> return $ Right ()
 
 handleBuildResult :: Logger -> Config -> Repo -> BuildResult
@@ -532,12 +618,17 @@ syncRepo logger config repo = do
   case existsResult of
     Left err -> return $ Left err
     Right () -> do
-      fetchResult <- fetchLatestVersion logger config repo
+      fetchResult <- fetchLatestVersion logger repoDir
       case fetchResult of
         Left err -> do
           logger $ T.pack $ "Fetch failed: " ++ err
           return $ Left err
         Right () -> do
+          notifyResult <- notify logger (getNotifyURL config) repo
+          case notifyResult of
+            Left err ->
+              logger $ T.pack $ "Warning: Notification failed: " ++ err
+            Right () -> return ()
           buildResult <- buildRepo logger repoDir
           handleBuildResult logger config repo buildResult
 
@@ -551,8 +642,8 @@ mkConfig dir = Config
   )
   [ mkRepo (RelDir "cord")
            (URL "https://github.com/cordcivilian/cord.git")
-  , mkRepo (RelDir "anorby")
-           (URL "https://github.com/cordcivilian/anorby.git")
+  -- , mkRepo (RelDir "anorby")
+  --          (URL "https://github.com/cordcivilian/anorby.git")
   ]
 
 main :: IO ()
@@ -575,9 +666,9 @@ main = do
 
   -- Build all repos initially
   let repos = unRepos initialConfig
-  mapM_ 
+  mapM_
     (\repo -> do
-      buildResult <- buildRepo TIO.putStrLn $ 
+      buildResult <- buildRepo TIO.putStrLn $
         FP.normalise $ getReposDir initialConfig FP.</> getLocalRepoDir repo
       Monad.void $
         handleBuildResult TIO.putStrLn initialConfig repo buildResult
@@ -589,7 +680,7 @@ main = do
     mapM_
       (\execPath -> do
         exists <- Dir.doesFileExist execPath
-        Monad.when exists $ 
+        Monad.when exists $
           ensureProcessRunning TIO.putStrLn procRef execPath
       ) repoExecs
     Concurrent.threadDelay 5000000  -- Check every 5 seconds
