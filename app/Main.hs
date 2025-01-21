@@ -456,16 +456,32 @@ deployAndNotify logger config repo execPath deployDir = do
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
-runCommands :: [(FilePath, [String])] -> IO Bool
-runCommands [] = return True
-runCommands (expr:rest) = do
-  let cmd = fst expr
-      args = snd expr
-  (_, _, _, ph) <- Process.createProcess (Process.proc cmd args)
+runCommands :: Logger -> [(FilePath, [String])] -> IO Bool
+runCommands _ [] = return True
+runCommands logger ((cmd, args):rest) = do
+  let procLogger = withContext logger "command" 
+        (JSON.String $ T.pack $ cmd ++ " " ++ unwords args)
+      
+  (_, Just stdout, Just stderr, ph) <- Process.createProcess (Process.proc cmd args)
+    { Process.std_out = Process.CreatePipe
+    , Process.std_err = Process.CreatePipe
+    }
+  
   exitCode <- Process.waitForProcess ph
+  
+  maybeSecret <- SysEnv.lookupEnv "HOOKER"
+  Monad.when (Maybe.isNothing maybeSecret) $ do
+    outContent <- IO.hGetContents stdout
+    Monad.unless (null outContent) $
+      logInfo procLogger "command_output" $ T.pack outContent
+  
+  errContent <- IO.hGetContents stderr
+  Monad.unless (null errContent) $
+    logError procLogger "command_error" $ T.pack errContent
+    
   case exitCode of
-      Exit.ExitSuccess -> runCommands rest
-      Exit.ExitFailure _ -> return False
+    Exit.ExitSuccess -> runCommands logger rest
+    Exit.ExitFailure _ -> return False
 
 initializeAllRepos :: Logger -> Config -> IO ()
 initializeAllRepos logger config = do
@@ -484,7 +500,7 @@ initializeAllRepos logger config = do
 initializeRepo :: Logger -> Config -> Repo -> IO (SyncResult ())
 initializeRepo logger config repo = do
   let baseDir = getReposDir config
-      repoDir = FP.normalise $ baseDir FP.</> unPath (repoPath repo)
+      repoDir = FP.normalise $ baseDir FP.</> getLocalRepoDir repo
 
   exists <- Dir.doesDirectoryExist repoDir
   if exists
@@ -492,25 +508,33 @@ initializeRepo logger config repo = do
       fetchResult <- fetchLatestVersion logger repoDir
       case fetchResult of
         Right () -> do
-          isSuccessful <- runCommands [("cabal", ["clean"])]
-          if isSuccessful
-            then return $ Right ()
-            else do
-              let err = "Failed to clean build directory"
-              logError logger "init" $ T.pack err
-              return $ Left err
+          cleanResult <- Exception.try $
+            runCommands logger [("cabal", ["clean"])]
+          case cleanResult of
+            Left e -> do
+              logWarn logger "init" $ T.pack $
+                "Failed to clean build directory (continuing anyway): " ++ 
+                show (e :: Exception.SomeException)
+              return $ Right ()
+            Right isSuccessful -> 
+              if isSuccessful
+                then return $ Right ()
+                else do
+                  logWarn logger "init" $ T.pack $
+                    "Failed to clean build directory (continuing anyway)"
+                  return $ Right ()
         Left err -> do
           logError logger "init" $ T.pack $
             "Failed to fetch latest version: " ++ err
           return $ Left err
     else do
       Dir.createDirectoryIfMissing True baseDir
-      isSuccessful <- runCommands
+      isSuccessful <- runCommands logger
         [ ("git", [ "clone", "-q", getCloneURL repo, repoDir ]) ]
 
-      if isSuccessful
-        then return $ Right ()
-        else do
+      case isSuccessful of
+        True -> return $ Right ()
+        False -> do
           let err = "Failed to clone repository"
           logError logger "init" $ T.pack err
           return $ Left err
@@ -521,7 +545,7 @@ fetchLatestVersion logger path = do
         (JSON.String $ T.pack path)
 
   Dir.setCurrentDirectory path
-  isSuccessful <- runCommands
+  isSuccessful <- runCommands gitLogger
     [ ("git", ["fetch", "-q", "--atomic", "origin", "main"])
     , ("git", ["reset", "--hard", "origin/main"])
     , ("git", ["clean", "-dxqf"])
@@ -549,7 +573,7 @@ ensureRepoExists logger dir = do
 
 syncRepo :: Logger -> Config -> Repo -> IO (SyncResult ())
 syncRepo logger config repo = do
-  let repoDir = FP.normalise $ getReposDir config FP.</> unPath (repoPath repo)
+  let repoDir = FP.normalise $ getReposDir config FP.</> getLocalRepoDir repo
       repoLogger = withContext logger "repo_dir"
         (JSON.String $ T.pack repoDir)
 
@@ -569,15 +593,25 @@ syncRepo logger config repo = do
           return $ Left err
 
         Right () -> do
-          cleanResult <- runCommands [("cabal", ["clean"])]
-          case cleanResult of
-            False -> do
-              let err = "Failed to clean build directory"
-              logError repoLogger "sync" $ T.pack err
-              return $ Left err
-            True -> do
+          cleanResult <- Exception.try $
+            runCommands repoLogger [("cabal", ["clean"])]
+          case cleanResult of 
+            Left e -> do
+              logWarn repoLogger "sync" $ T.pack $
+                "Failed to clean build directory (continuing anyway): " ++ 
+                show (e :: Exception.SomeException)
               buildResult <- buildRepo repoLogger repoDir
               handleBuildResult repoLogger config repo buildResult
+            Right isSuccessful ->
+              if not isSuccessful
+                then do
+                  logWarn repoLogger "sync" $ T.pack $
+                    "Failed to clean build directory (continuing anyway)"
+                  buildResult <- buildRepo repoLogger repoDir
+                  handleBuildResult repoLogger config repo buildResult
+                else do
+                  buildResult <- buildRepo repoLogger repoDir
+                  handleBuildResult repoLogger config repo buildResult
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
