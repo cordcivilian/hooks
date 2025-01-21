@@ -45,7 +45,7 @@ import qualified System.Process as Process
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
 monolith :: IORef.IORef Config -> IORef.IORef Logger -> Wai.Application
-monolith statesRef loggerRef =
+monolith configRef loggerRef =
   Mid.logStdout $ \request respond -> do
     logger <- IORef.readIORef loggerRef
     body <- Wai.lazyRequestBody request
@@ -63,12 +63,11 @@ monolith statesRef loggerRef =
 
     response <- case (method, path) of
       ("GET", "/") -> return $ rootRoute request
-      ("POST", "/events") -> do
-        response <- hookRoute statesRef reqLogger request body
-        return response
+      ("POST", "/events") -> 
+        hookRoute configRef reqLogger request body
       ("GET", "/hooked/list") -> do
-        response <- hookedListRoute statesRef
-        return response
+        config <- IORef.readIORef configRef
+        return $ hookedListRoute config
       ("GET", "/test") -> return $ testRoute request
       _ -> return notFoundRoute
 
@@ -86,8 +85,8 @@ rootRoute request = Wai.responseLBS
 
 hookRoute :: IORef.IORef Config -> Logger -> Wai.Request -> BSLC.ByteString
           -> IO Wai.Response
-hookRoute statesRef logger request body = do
-  config <- IORef.readIORef statesRef
+hookRoute configRef logger request body = do
+  config <- IORef.readIORef configRef
   maybeSecret <- SysEnv.lookupEnv "HOOKER"
   let secret = maybe "" id maybeSecret
       signature = lookup "x-hub-signature-256" $ Wai.requestHeaders request
@@ -95,14 +94,14 @@ hookRoute statesRef logger request body = do
         (JSON.String "/events")
 
   case (verifySignature body signature secret, getEventInfo body) of
-    (Right (), Just event) -> case ref event of
+    (Right (), Just event) -> case eventRef event of
       "refs/heads/main" -> do
-        let fullName = repoFullName event
-            hookedRepo = remoteFullNameToHookedRepo config fullName
+        let fullName = eventRepoName event
+            hookedRepos = remoteFullNameToHookedRepo config fullName
             eventLogger = withContext contextLogger "repo"
               (JSON.String $ T.pack fullName)
 
-        mapM_ (syncRepo eventLogger config) hookedRepo
+        mapM_ (syncRepo eventLogger config) hookedRepos
 
       _ -> return ()
 
@@ -118,13 +117,11 @@ hookRoute statesRef logger request body = do
     [(Headers.hContentType, BSC.pack "text/plain")]
     (BSLC.pack "event processed")
 
-hookedListRoute :: IORef.IORef Config -> IO Wai.Response
-hookedListRoute statesRef = do
-  config <- IORef.readIORef statesRef
-  return $ Wai.responseLBS
-      HTTP.status200
-      [ (Headers.hContentType, BSC.pack "text/plain") ]
-      (BSLC.unlines $ map (BSLC.pack . show) (unRepos config))
+hookedListRoute :: Config -> Wai.Response
+hookedListRoute config = Wai.responseLBS
+    HTTP.status200
+    [ (Headers.hContentType, BSC.pack "text/plain") ]
+    (BSLC.unlines $ map (BSLC.pack . show . repoPath) (repos config))
 
 notFoundRoute :: Wai.Response
 notFoundRoute = Wai.responseLBS
@@ -248,7 +245,10 @@ createProcessPipes logger execPath = do
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
-data Event = Event { ref :: String , repoFullName :: String } deriving (Show)
+data Event = Event 
+  { eventRef :: String
+  , eventRepoName :: String 
+  } deriving (Show)
 
 instance JSON.FromJSON Event where
   parseJSON = JSON.withObject "Event" $ \v -> Event
@@ -300,10 +300,10 @@ data BuildResult = BuildSuccess FilePath | BuildFailure String
   deriving (Show)
 
 buildRepo :: Logger -> FilePath -> IO BuildResult
-buildRepo logger repoPath = do
-  Dir.setCurrentDirectory repoPath
+buildRepo logger path = do
+  Dir.setCurrentDirectory path
   (exitCode, _, stderr) <- Process.readCreateProcessWithExitCode
-    (Process.proc "cabal" ["build", "--enable-optimization=2"]) ""
+    (Process.proc "cabal" ["build"]) ""
   case exitCode of
     Exit.ExitSuccess -> do
       (buildExit, buildPath, _) <- Process.readCreateProcessWithExitCode
@@ -322,25 +322,22 @@ buildRepo logger repoPath = do
       logError logger "build" $ T.pack $ "Build failed:\n" ++ stderr
       return $ BuildFailure $ "Build failed:\n" ++ stderr
 
-handleBuildResult :: Logger -> Config -> Repo -> BuildResult
+handleBuildResult :: Logger -> Config -> Repo -> BuildResult 
                   -> IO (SyncResult ())
 handleBuildResult logger config repo result =
   case result of
     BuildFailure err -> do
       logError logger "build" $ T.pack $ "Build failed: " ++ err
       return $ Left err
-
     BuildSuccess execPath -> do
-      let deployDir = getReposDir config FP.</> "hooked-bin"
-
-      deployDirResult <- ensureDeployDir logger deployDir
+      let deployDir = Path $ getReposDir config FP.</> "hooked-bin"
+      deployDirResult <- ensureDeployDir logger (unPath deployDir)
       case deployDirResult of
         Left err -> do
           logError logger "build" $ T.pack $
             "Deploy directory setup failed: " ++ err
           return $ Left err
-        Right () ->
-          deployAndNotify logger config repo execPath deployDir
+        Right () -> deployAndNotify logger config repo execPath deployDir
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
@@ -355,14 +352,14 @@ ensureDeployDir logger deployDir = do
       logError logger "deploy" $ T.pack err
       return $ Left err
 
-deployExecutable :: Logger -> FilePath -> FilePath -> Repo -> Config
+deployExecutable :: Logger -> FilePath -> Path -> Repo -> Config
                 -> IO (Either String [FilePath])
 deployExecutable logger srcPath destDir repo config = do
   exists <- Dir.doesFileExist srcPath
   if exists
     then do
       let fileName = FP.takeFileName srcPath
-          exeDir = destDir FP.</> fileName
+          exeDir = unPath destDir FP.</> fileName
           destPath = exeDir FP.</> fileName
           backupPath = destPath ++ ".bak"
 
@@ -388,14 +385,15 @@ deployExecutable logger srcPath destDir repo config = do
             Dir.setOwnerReadable True $
             Dir.emptyPermissions
 
-          case copyPaths repo of
-            Nothing -> do
+          case extraPaths repo of
+            [] -> do
               logInfo logger "deploy" $ T.pack $
                 "Deployed to " ++ destPath
               return $ Right [destPath]
-            Just paths -> do
-              let repoRoot = getReposDir config FP.</> getLocalRepoDir repo
-              copyResult <- copyFilesAndDirs logger repoRoot exeDir paths
+            paths -> do
+              let repoRoot = getReposDir config FP.</> unPath (repoPath repo)
+              copyResult <- copyFilesAndDirs logger repoRoot exeDir 
+                             (map unPath paths)
               case copyResult of
                 Left err -> return $ Left err
                 Right copiedPaths -> do
@@ -443,7 +441,7 @@ copyFilesAndDirs logger srcDir destDir paths = do
     ([], paths') -> return $ Right paths'
     (errs:_, _) -> return $ Left errs
 
-deployAndNotify :: Logger -> Config -> Repo -> FilePath -> FilePath
+deployAndNotify :: Logger -> Config -> Repo -> FilePath -> Path
                 -> IO (SyncResult ())
 deployAndNotify logger config repo execPath deployDir = do
   deployResult <- deployExecutable logger execPath deployDir repo config
@@ -454,7 +452,7 @@ deployAndNotify logger config repo execPath deployDir = do
     Right paths -> do
       logInfo logger "deploy" $ T.pack $
         "Successfully deployed: " ++ show paths
-      notify logger (getNotifyURL config) repo
+      notify logger (notifyUrl config) repo
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
@@ -471,20 +469,22 @@ runCommands (expr:rest) = do
 
 initializeAllRepos :: Logger -> Config -> IO ()
 initializeAllRepos logger config = do
-  let repos = unRepos config
-  mapM_ (\repo -> do
-    result <- initializeRepo logger config repo
-    case result of
-      Left err ->
-        logError logger "init" $ T.pack $
-          "Failed to initialize " ++ getLocalRepoDir repo ++ ": " ++ err
-      Right () -> return ()
-    ) repos
+  mapM_ (initRepo logger config) (repos config)
+  where
+    initRepo :: Logger -> Config -> Repo -> IO ()
+    initRepo l c r = do
+      result <- initializeRepo l c r
+      case result of
+        Left err ->
+          logError l "init" $ T.pack $
+            "Failed to initialize " ++ 
+            unPath (repoPath r) ++ ": " ++ err
+        Right () -> return ()
 
 initializeRepo :: Logger -> Config -> Repo -> IO (SyncResult ())
 initializeRepo logger config repo = do
   let baseDir = getReposDir config
-      repoDir = FP.normalise $ baseDir FP.</> getLocalRepoDir repo
+      repoDir = FP.normalise $ baseDir FP.</> unPath (repoPath repo)
 
   exists <- Dir.doesDirectoryExist repoDir
   if exists
@@ -493,9 +493,9 @@ initializeRepo logger config repo = do
       case fetchResult of
         Right () -> do
           isSuccessful <- runCommands [("cabal", ["clean"])]
-          case isSuccessful of
-            True -> return $ Right ()
-            False -> do
+          if isSuccessful
+            then return $ Right ()
+            else do
               let err = "Failed to clean build directory"
               logError logger "init" $ T.pack err
               return $ Left err
@@ -508,18 +508,19 @@ initializeRepo logger config repo = do
       isSuccessful <- runCommands
         [ ("git", [ "clone", "-q", getCloneURL repo, repoDir ]) ]
 
-      case isSuccessful of
-        True -> return $ Right ()
-        False -> do
+      if isSuccessful
+        then return $ Right ()
+        else do
           let err = "Failed to clone repository"
           logError logger "init" $ T.pack err
           return $ Left err
 
 fetchLatestVersion :: Logger -> FilePath -> IO (Either String ())
-fetchLatestVersion logger repoPath = do
+fetchLatestVersion logger path = do
   let gitLogger = withContext logger "repo_path"
-        (JSON.String $ T.pack repoPath)
+        (JSON.String $ T.pack path)
 
+  Dir.setCurrentDirectory path
   isSuccessful <- runCommands
     [ ("git", ["fetch", "-q", "--atomic", "origin", "main"])
     , ("git", ["reset", "--hard", "origin/main"])
@@ -548,7 +549,7 @@ ensureRepoExists logger dir = do
 
 syncRepo :: Logger -> Config -> Repo -> IO (SyncResult ())
 syncRepo logger config repo = do
-  let repoDir = FP.normalise $ getReposDir config FP.</> getLocalRepoDir repo
+  let repoDir = FP.normalise $ getReposDir config FP.</> unPath (repoPath repo)
       repoLogger = withContext logger "repo_dir"
         (JSON.String $ T.pack repoDir)
 
@@ -590,24 +591,22 @@ instance JSON.ToJSON Notification where
       , "version" JSON..= version
       ]
 
-notify :: Logger -> String -> Repo -> IO (Either String ())
-notify logger url repo = do
+notify :: Logger -> URL -> Repo -> IO (Either String ())
+notify logger notifyURL repo = do
   let notifyLogger = withContext logger "notify_url"
-        (JSON.String $ T.pack url)
-
+        (JSON.String $ T.pack $ unURL notifyURL)
+        
   maybeSecret <- SysEnv.lookupEnv "HOOKER"
   case maybeSecret of
     Nothing -> return $ Right ()
-
     Just secret -> do
       currentTime <- Clock.getCurrentTime
-      initRequestResult <- Exception.try (HTTP.parseRequest url)
+      initRequestResult <- Exception.try (HTTP.parseRequest $ unURL notifyURL)
       case initRequestResult of
         Left e -> do
           let errMsg = "Failed to parse URL: " ++
                           show (e :: Exception.SomeException)
-          logError notifyLogger "notify" $
-            T.pack errMsg
+          logError notifyLogger "notify" $ T.pack errMsg
           return $ Left errMsg
 
         Right initRequest -> do
@@ -616,10 +615,9 @@ notify logger url repo = do
                   DateTimeFormat.defaultTimeLocale "%H" currentTime)
               dailyVersion = DateTimeFormat.formatTime
                 DateTimeFormat.defaultTimeLocale "%Y-%m-%d" currentTime
-              body = JSON.encode $
-                Notification
-                  (getHtmlURL repo)
-                  (dailyVersion ++ [hourlyVersion])
+              body = JSON.encode $ Notification
+                (getHtmlURL repo)
+                (dailyVersion ++ [hourlyVersion])
               signature = [BSC.pack "sha256=", sign body secret]
               request = HTTP.setRequestMethod "POST" $
                 HTTP.setRequestSecure True $
@@ -630,8 +628,7 @@ notify logger url repo = do
                     )
                   , ("Hooker-Signature-256", BSC.concat signature)
                   ] $
-                HTTP.setRequestBodyLBS body $
-                initRequest
+                HTTP.setRequestBodyLBS body initRequest
 
           responseResult <- Exception.try (HTTP.httpLBS request)
           case responseResult of
@@ -790,35 +787,50 @@ ensureProcessRunning logger procRef execPath = do
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
-mkDeploy :: AbsDir -> URL -> Deploy
-mkDeploy dir url = Deploy (ReposDir dir) (NotifyURL url)
+mkPath :: FilePath -> Path
+mkPath = Path . FP.normalise
 
-mkRepo :: RelDir -> URL -> [FilePath] -> Repo
-mkRepo dir url paths = Repo (LocalRepoDir dir) (CloneURL url) $
-  if null paths then Nothing else Just paths
+mkURL :: String -> URLType -> Either String URL
+mkURL url uType = 
+  case URI.parseURI url of
+    Just uri | isValidScheme uri -> Right $ URL url uType
+    Just _ -> Left "Invalid URL scheme: must be http(s)"
+    Nothing -> Left "Invalid URL format"
+  where
+    isValidScheme uri = case URI.uriScheme uri of
+      "http:" -> True
+      "https:" -> True
+      _ -> False
+
+mkRepo :: FilePath -> URL -> [Path] -> Repo 
+mkRepo path url extra = Repo
+  { repoPath = Path path
+  , repoUrl = url
+  , extraPaths = extra
+  }
 
 getReposDir :: Config -> FilePath
-getReposDir config = unAbsDir $ unReposDir $ reposDir $ unDeploy $ config
+getReposDir = unPath . reposPath
 
-getNotifyURL :: Config -> String
-getNotifyURL config = unURL $ unNotifyURL $ notifyURL $ unDeploy $ config
+getNotifyURL :: Config -> String 
+getNotifyURL = unURL . notifyUrl
 
 getLocalRepoDir :: Repo -> FilePath
-getLocalRepoDir repo = unRelDir $ unLocalRepoDir $ localRepoDir $ repo
+getLocalRepoDir = unPath . repoPath
 
 getCloneURL :: Repo -> String
-getCloneURL repo = unURL $ unCloneURL $ cloneURL $ repo
+getCloneURL = unURL . repoUrl
 
 getHtmlURL :: Repo -> String
 getHtmlURL repo =
-  let url = T.pack $ unURL $ unCloneURL $ cloneURL $ repo
+  let url = T.pack $ unURL $ repoUrl repo
   in case T.stripSuffix ".git" url of
        Just htmlURL -> T.unpack htmlURL
        Nothing -> T.unpack url
 
 remoteFullNameToHookedRepo :: Config -> String -> [Repo]
 remoteFullNameToHookedRepo config fullName =
-  filter (isHookedOnRemote fullName) (unRepos config)
+  filter (isHookedOnRemote fullName) (repos config)
 
 isHookedOnRemote :: String -> Repo -> Bool
 isHookedOnRemote fullName repo =
@@ -828,46 +840,45 @@ isHookedOnRemote fullName repo =
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
-newtype AbsDir = AbsDir { unAbsDir :: String } deriving (Eq, Show)
-newtype RelDir = RelDir { unRelDir :: String } deriving (Eq, Show)
-newtype URL = URL { unURL :: String }  deriving (Eq, Show)
-
-newtype ReposDir = ReposDir { unReposDir :: AbsDir } deriving (Eq, Show)
-newtype LocalRepoDir = LocalRepoDir
-  { unLocalRepoDir :: RelDir } deriving (Eq, Show)
-
-newtype NotifyURL = NotifyURL { unNotifyURL :: URL } deriving (Eq, Show)
-newtype CloneURL = CloneURL { unCloneURL :: URL } deriving (Eq, Show)
-
-data Deploy = Deploy
-  { reposDir :: ReposDir , notifyURL :: NotifyURL } deriving (Eq, Show)
-
-data Repo = Repo
-  { localRepoDir :: LocalRepoDir
-  , cloneURL :: CloneURL
-  , copyPaths :: Maybe [FilePath]
+newtype Path = Path
+  { unPath :: FilePath
   } deriving (Eq, Show)
 
-data Config = Config
-  { unDeploy :: Deploy
-  , unRepos :: [Repo]
+data URL = URL 
+  { unURL :: String
+  , urlType :: URLType 
+  } deriving (Eq, Show)
+
+data URLType = Clone
+             | Notify deriving (Eq, Show)
+
+data Config = Config 
+  { reposPath :: Path
+  , notifyUrl :: URL
+  , repos :: [Repo]
+  } deriving (Eq, Show)
+
+data Repo = Repo
+  { repoPath :: Path
+  , repoUrl :: URL
+  , extraPaths :: [Path]
   } deriving (Eq, Show)
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
-mkConfig :: AbsDir -> Config
+mkConfig :: FilePath -> Config
 mkConfig dir = Config
-  ( mkDeploy
-      (AbsDir $ unAbsDir dir FP.</> "hooked-repos")
-      (URL "https://www.cordcivilian.com/updated")
-  )
-  [ mkRepo (RelDir "cord")
-           (URL "https://github.com/cordcivilian/cord.git")
-           []
-  , mkRepo (RelDir "anorby")
-           (URL "https://github.com/cordcivilian/anorby.git")
-           ["data"]
-  ]
+  { reposPath = Path $ dir FP.</> "hooked-repos"
+  , notifyUrl = URL "https://www.cordcivilian.com/updated" Notify
+  , repos =
+    [ mkRepo "cord" 
+        (URL "https://github.com/cordcivilian/cord.git" Clone)
+        []
+    , mkRepo "anorby"
+        (URL "https://github.com/cordcivilian/anorby.git" Clone)
+        [Path "data"]
+    ]
+  }
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
@@ -885,7 +896,7 @@ main = do
     "Server starting on port " ++ show (port :: Int)
 
   home <- Dir.getHomeDirectory
-  let initialConfig = mkConfig $ AbsDir home
+  let initialConfig = mkConfig home
   config <- IORef.newIORef initialConfig
 
   initializeAllRepos logger initialConfig
@@ -895,22 +906,23 @@ main = do
   Dir.createDirectoryIfMissing True binDir
 
   -- Build repositories
-  let repos = unRepos initialConfig
+  let repos' = repos initialConfig
   mapM_
     (\repo -> do
       let repoLogger = withContext logger "repo"
-            (JSON.String $ T.pack $ getLocalRepoDir repo)
+            (JSON.String $ T.pack $ unPath $ repoPath repo)
       buildResult <- buildRepo repoLogger $
-        FP.normalise $ getReposDir initialConfig FP.</> getLocalRepoDir repo
+        FP.normalise $ getReposDir initialConfig FP.</> 
+          unPath (repoPath repo)
       Monad.void $
         handleBuildResult repoLogger initialConfig repo buildResult
-    ) repos
+    ) repos'
 
   -- Start process monitor silently
   _ <- Concurrent.forkIO $ Monad.forever $ do
     let repoExecs = map (\repo ->
-          let exeName = FP.takeFileName $ getLocalRepoDir repo
-          in binDir FP.</> exeName FP.</> exeName) repos
+          let exeName = FP.takeFileName $ unPath $ repoPath repo
+          in binDir FP.</> exeName FP.</> exeName) repos'
     mapM_
       (\execPath -> do
         exists <- Dir.doesFileExist execPath
