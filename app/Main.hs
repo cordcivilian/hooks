@@ -404,7 +404,7 @@ deployExecutable logger srcPath destDir repo config procRef = do
           destPath = exeDir FP.</> fileName
           backupPath = destPath ++ ".bak"
 
-      stopProcess logger destPath
+      stopProcess logger procRef destPath 
 
       Dir.createDirectoryIfMissing True exeDir
 
@@ -859,7 +859,7 @@ ensureProcessRunning logger procRef execPath = do
           modTime <- Dir.getModificationTime execPath
           if modTime > procStartTime info
             then do
-              stopProcess logger execPath
+              stopProcess logger procRef execPath 
               startNewProcess logger procRef execPath
             else return ()
         Nothing -> do
@@ -880,20 +880,33 @@ ensureProcessRunning logger procRef execPath = do
 
     Nothing -> startNewProcess logger procRef execPath
 
-stopProcess :: Logger -> FilePath -> IO ()
-stopProcess logger execPath = do
+stopProcess :: Logger -> IORef.IORef ProcessMap -> FilePath -> IO ()
+stopProcess logger procRef execPath = do
   let procLogger =
         withContext logger "executable" (JSON.String $ T.pack execPath)
-  existingPID <- findExistingProcess execPath
-  case existingPID of
-    Just pid -> do
-      result <- Exception.try $ Process.callProcess "kill" [show pid]
+  procs <- IORef.readIORef procRef
+  case lookup execPath procs of
+    Just (ProcessInfo handle _ _) -> do
+      result <- Exception.try $ do
+        Process.terminateProcess handle
+        _ <- Process.waitForProcess handle
+        return ()
       case result of
         Left e -> logError procLogger "process" $ T.pack $
           "Failed to stop process: " ++ show (e :: Exception.SomeException)
-        Right _ -> logInfo procLogger "process" "Stopped process"
-    Nothing ->
-      logInfo procLogger "process" "No process found to stop"
+        Right _ -> do
+          IORef.modifyIORef procRef (filter ((/= execPath) . fst))
+          logInfo procLogger "process" "Stopped process"
+    Nothing -> logInfo procLogger "process" "No process found to stop"
+
+cleanupProcesses :: IORef.IORef ProcessMap -> Logger -> IO ()
+cleanupProcesses procRef logger = do
+  procs <- IORef.readIORef procRef
+  Monad.forM_ procs $ \(path, ProcessInfo handle _ _) -> do
+    Exception.finally (Process.terminateProcess handle)
+                      (Process.waitForProcess handle)
+    logInfo logger "shutdown" $ T.pack $ "Cleaned up process: " ++ path
+  IORef.writeIORef procRef []
 
 --DZJ-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D-D
 
@@ -1045,4 +1058,5 @@ main = do
   Monad.when (Maybe.isNothing maybeSecret) $
     logInfo logger "startup" "Development server started"
 
-  Warp.run port $ monolith config loggerRef procRef
+  let app = Warp.run port $ monolith config loggerRef procRef
+  Exception.finally app $ cleanupProcesses procRef logger
