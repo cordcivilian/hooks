@@ -9,6 +9,9 @@
 9. repeat
 10. profit
 
+> [!TIP]
+> hooks will skip 5-7 if webhook notification is not from a hooked repo
+
 ## github webhook setup
 - payload url: `https://your-hooks-server.com/events`
 - content type: `application/json`
