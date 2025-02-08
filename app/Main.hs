@@ -98,7 +98,7 @@ hookRoute configRef logger request body procRef = do
       contextLogger = withContext logger "path"
         (JSON.String "/events")
 
-  case (verifySignature body signature secret, getEventInfo body) of
+  _ <- case (verifySignature body signature secret, getEventInfo body) of
     (Right (), Just event) -> case eventRef event of
       "refs/heads/main" -> do
         let fullName = eventRepoName event
@@ -106,16 +106,29 @@ hookRoute configRef logger request body procRef = do
             eventLogger = withContext contextLogger "repo"
               (JSON.String $ T.pack fullName)
 
-        mapM_ (syncRepo eventLogger config `flip` procRef) hookedRepos
+        if null hookedRepos
+          then do
+            notify eventLogger (notifyUrl config) $ Repo
+              { repoPath = Path "temp"
+              , repoUrl = URL ("https://github.com/" ++ fullName) Clone
+              , extraPaths = []
+              }
+          else do
+            results <-
+              mapM (syncRepo eventLogger config `flip` procRef) hookedRepos
+            case Either.partitionEithers results of
+              ([], _) -> return $ Right ()
+              (err:_, _) -> return $ Left err
 
-      _ -> return ()
+      _ -> return $ Right ()
 
-    (Left err, _) ->
-      logError contextLogger "webhook" $
-        "Invalid signature: " <> err
+    (Left err, _) -> do
+      logError contextLogger "webhook" $ "Invalid signature: " <> err
+      return $ Left $ T.unpack err
 
-    (_, Nothing) ->
+    (_, Nothing) -> do
       logError contextLogger "webhook" "Invalid event payload"
+      return $ Left "Invalid event payload"
 
   return $ Wai.responseLBS
     HTTP.status200
