@@ -698,7 +698,7 @@ notify logger notifyURL repo = do
                 (read $ DateTimeFormat.formatTime
                   DateTimeFormat.defaultTimeLocale "%H" currentTime)
               dailyVersion = DateTimeFormat.formatTime
-                DateTimeFormat.defaultTimeLocale "%Y-%m-%d" currentTime
+                DateTimeFormat.defaultTimeLocale "%Y.%m.%d" currentTime
               body = JSON.encode $ Notification
                 (getHtmlURL repo)
                 (dailyVersion ++ [hourlyVersion])
