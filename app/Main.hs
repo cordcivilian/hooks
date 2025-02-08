@@ -984,9 +984,9 @@ mkConfig dir = Config
     [ mkRepo "cord"
         (URL "https://github.com/cordcivilian/cord.git" Clone)
         []
-    , mkRepo "anorby"
-        (URL "https://github.com/cordcivilian/anorby.git" Clone)
-        [Path "data"]
+    -- , mkRepo "anorby"
+    --     (URL "https://github.com/cordcivilian/anorby.git" Clone)
+    --     [Path "data"]
     ]
   }
 
